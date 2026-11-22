@@ -309,6 +309,8 @@ pub struct Workspace {
     /// Header "…" menu and its open submenu.
     pub doc_menu: bool,
     pub doc_sub: Option<DocSub>,
+    /// 窗口保持在最前 (the "…" menu): this window floats above other apps'; not remembered.
+    pub on_top: bool,
     /// Last-frame bounds of the open submenu (clicks there keep the menu open).
     pub doc_sub_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Rendered width of the open 「…」 menu, for placing its submenus (#225).
@@ -580,6 +582,7 @@ impl Workspace {
             file_history: Default::default(),
             more_bounds: Default::default(),
             doc_menu: false,
+            on_top: false,
             doc_sub: None,
             doc_sub_bounds: Rc::new(Cell::new(None)),
             doc_menu_w: Rc::new(Cell::new(None)),

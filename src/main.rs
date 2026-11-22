@@ -46,6 +46,7 @@ mod native_header;
 #[cfg(not(target_os = "macos"))]
 #[path = "native_header_fallback.rs"]
 mod native_header;
+mod on_top;
 mod printing;
 mod search;
 mod sidebar;

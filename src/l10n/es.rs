@@ -1027,4 +1027,6 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("部分中文", "Chino parcial"),
     ("下载后可预览", "Vista previa tras descargar"),
     ("其他语言和符号（{}）", "Otras escrituras y símbolos ({})"),
+    ("窗口保持在最前", "Mantener la ventana delante"),
+    ("窗口会一直显示在其他应用的窗口之上", "Se queda por encima de las ventanas de otras apps"),
 ];

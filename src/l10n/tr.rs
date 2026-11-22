@@ -1080,4 +1080,6 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("部分中文", "Kısmi Çince"),
     ("下载后可预览", "İndirdikten sonra önizleme"),
     ("其他语言和符号（{}）", "Diğer yazılar ve simgeler ({})"),
+    ("窗口保持在最前", "Pencereyi önde tut"),
+    ("窗口会一直显示在其他应用的窗口之上", "Diğer uygulamaların pencerelerinin üstünde kalır"),
 ];
