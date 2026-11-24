@@ -777,24 +777,32 @@ pub fn image_path_in(root: &Path, src: &str) -> Option<PathBuf> {
     if p.fs_is_absolute() {
         return Some(moved_asset(root, &p).unwrap_or(p));
     }
-    // Relative to the library (`.assets/…`); not a URI or a cloud token.
-    (!src.is_empty() && !src.contains(':') && src.contains('/')).then(|| root.join(p))
+    // Another system's absolute path: the same file in this library's images folder.
+    if crate::paths::is_absolute_anywhere(src) { return in_assets(root, src) }
+    // Relative to the library (`.assets/…`, either separator); not a URI or a cloud token.
+    (!src.is_empty() && !src.contains(':') && src.contains(['/', '\\'])).then(|| crate::paths::resolve(src, root))
 }
 
-/// Images and attachments are kept by absolute path (pasted ones too), so one
-/// that is gone may just have moved with the library: `assets/` became
+/// Pages from before docs/FORMAT.md's path rule keep images and attachments by
+/// absolute path (pasted ones too), so one that is gone may just have moved with the library: `assets/` became
 /// `.assets/` in the move to real folders (#213), or the library itself was
 /// moved. The same file in this library's images folder, when it is there.
 fn moved_asset(root: &Path, p: &Path) -> Option<PathBuf> {
-    use std::path::Component;
     if p.fs_exists() { return None; }
-    let parts: Vec<Component> = p.components().collect();
+    in_assets(root, &p.to_string_lossy())
+}
+
+/// The file an absolute path `written` names (this system's or another's: either
+/// separator) as it is in the library at `root`'s images folder, when it is there:
+/// the part after its last `assets` / `.assets` folder.
+fn in_assets(root: &Path, written: &str) -> Option<PathBuf> {
+    let parts: Vec<&str> = crate::paths::parts(written).collect();
     let dir = Store::assets_in(root);
     // The last folder so named that leads to a file; a file may be named `assets` itself.
-    (0..parts.len()).rev().filter(|&i| matches!(parts[i].as_os_str().to_str(), Some("assets" | ".assets"))).find_map(|i| {
+    (0..parts.len()).rev().filter(|&i| matches!(parts[i], "assets" | ".assets")).find_map(|i| {
         let rest = &parts[i + 1..];
-        if rest.is_empty() || !rest.iter().all(|c| matches!(c, Component::Normal(_))) { return None; }
-        Some(dir.join(rest.iter().collect::<PathBuf>())).filter(|q| q.fs_exists())
+        if rest.is_empty() || rest.contains(&"..") { return None; }
+        Some(rest.iter().fold(dir.clone(), |p, s| p.join(s))).filter(|q| q.fs_exists())
     })
 }
 
@@ -1864,6 +1872,7 @@ impl Store {
         if !self.is_markdown(id) {
             let mut doc = docxml::parse(text)?;
             if text.contains("href=") { self.links_to_ids(&self.doc_dir(id), &mut doc); }
+            self.sources_here(&mut doc, None);
             return Ok(doc);
         }
         let mut doc = crate::markdown::parse_file(text, &self.markdown_title(id), self.base(id).as_deref());
@@ -1872,7 +1881,42 @@ impl Store {
         // Images a Markdown file carries inline (#133) become assets, so the
         // page shows them and an export writes them like any other picture.
         crate::data_images::absorb(&mut doc.blocks, &self.top_dir);
+        if self.base(id).is_none() { self.sources_here(&mut doc, Some(&Self::assets_in(&self.top_dir))); }
         Ok(doc)
+    }
+
+    /// A page's sources as this computer reads them (docs/FORMAT.md): a relative one
+    /// from the library; an absolute one that is not here (another system's, or
+    /// the library has moved) as the same file in this library's images folder,
+    /// when it is there, so the next save writes it relative. Links, data and
+    /// files outside the library stay as written. `within`: only those that
+    /// are under it here.
+    fn sources_here(&self, doc: &mut Document, within: Option<&Path>) {
+        let top = &self.top_dir;
+        let here = |src: &str| -> Option<String> {
+            if src.is_empty() || src.contains("://") || src.starts_with("data:") { return None }
+            if !crate::paths::is_absolute_anywhere(src) {
+                // As `image_path_in` has read them: a folder in it, no scheme.
+                return (src.contains(['/', '\\']) && !src.contains(':')).then(|| crate::paths::resolve(src, top).to_string_lossy().into_owned());
+            }
+            if Path::new(src).fs_is_absolute() && Path::new(src).fs_exists() { return None }
+            in_assets(top, src).map(|p| p.to_string_lossy().into_owned())
+        };
+        doc.map_sources(|src| here(src).filter(|p| within.is_none_or(|w| Path::new(p).starts_with(w))));
+    }
+
+    /// `doc` with the library's own files written relative to it with `/`
+    /// (`.assets/x.png`; docs/FORMAT.md), None when it has none to change.
+    /// Files outside the library keep their absolute path. `within`: only
+    /// those under it (a Markdown page writes its `![[…]]` embeds itself).
+    fn portable_sources(&self, doc: &Document, within: Option<&Path>) -> Option<Document> {
+        let top = &self.top_dir;
+        let portable = |src: &str| (Path::new(src).fs_is_absolute() && within.is_none_or(|w| Path::new(src).starts_with(w))).then(|| crate::paths::portable_in(Path::new(src), top)).flatten();
+        let cover = doc.cover.as_ref().map(|c| c.src.as_str());
+        if !doc.asset_sources().iter().map(String::as_str).chain(cover).any(|s| portable(s).is_some()) { return None }
+        let mut out = doc.clone();
+        out.map_sources(portable);
+        Some(out)
     }
 
     /// `doc` as `id`'s file contents; a Markdown file keeps the front matter it has on disk.
@@ -1884,6 +1928,8 @@ impl Store {
         if self.kind(id) == DocKind::Board { return (crate::whiteboard::write_file(doc), vec![]); }
         if self.kind(id) == DocKind::Table { return (String::new(), vec![]); }
         if !self.is_markdown(id) {
+            let portable = self.portable_sources(doc, None);
+            let doc = portable.as_ref().unwrap_or(doc);
             if !self.flat && !doc.doc_links().is_empty() {
                 let mut doc = doc.clone();
                 self.links_to_paths(&self.doc_dir(id), &mut doc);
@@ -1896,6 +1942,9 @@ impl Store {
         let name = base.is_some().then(|| self.markdown_title(id));
         let copied = self.copied.borrow();
         let wiki = disk.filter(|d| d.contains("![[")).and_then(|_| self.wiki_dirs(id));
+        // In the library, its images and attachments relative to it, as `parse_file` reads them.
+        let portable = base.is_none().then(|| self.portable_sources(doc, Some(&Self::assets_in(&self.top_dir)))).flatten();
+        let doc = portable.as_ref().unwrap_or(doc);
         let out = crate::markdown::write_file_with(doc, front, &crate::markdown::Options {
             library_dir: Some(&self.top_dir), base: base.as_deref(), name: name.as_deref(), copied: copied.get(id), original: disk,
             wiki: wiki.as_ref().map(|(d, v)| (d.as_path(), Some(v.as_path()))), ..Default::default()
@@ -2631,7 +2680,8 @@ impl Store {
             self.index.insert(id.clone(), Meta { created: t, modified: t, rel, ..Default::default() });
             derive_tree(&mut self.index);
         }
-        let text = format!("{front}{}", crate::markdown::write_file(doc, "", None));
+        let portable = self.portable_sources(doc, Some(&Self::assets_in(&self.top_dir)));
+        let text = format!("{front}{}", crate::markdown::write_file(portable.as_ref().unwrap_or(doc), "", None));
         if let Err(e) = self.write_file(&self.path(&id), text.as_bytes()).and_then(|_| self.save_index()) { self.index.remove(&id); return Err(e); }
         self.record_file_change(&id, None);
         drop(lock);
@@ -3197,7 +3247,7 @@ impl Store {
         if self.kind(id) == DocKind::Table {
             let p = crate::versions::path(&self.history_base(), id, name, false)?;
             anyhow::ensure!(p.fs_exists(), "历史版本已不存在");
-            let rel = p.strip_prefix(&self.top_dir).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+            let rel = crate::paths::portable_in(&p, &self.top_dir).unwrap_or_default();
             return Ok(crate::table::file_doc(&self.markdown_title(id), &rel));
         }
         let text = self.version_text(id, name)?;
@@ -6246,5 +6296,137 @@ mod tests {
         crate::vfs::write(s.trash_path(&id), b"not even xml").unwrap();
         // Read, it would not parse either: what shows comes from the index.
         assert_eq!(s.list_trash()[0].id, id);
+    }
+
+    /// v0.1.14's `image_path_in` (before docs/FORMAT.md's rule, without its
+    /// moved-library fallback): what an older build makes of a source.
+    fn image_path_v0_1_14(root: &Path, src: &str) -> Option<PathBuf> {
+        let p = PathBuf::from(src.strip_prefix("file://").unwrap_or(src));
+        if p.fs_is_absolute() { return Some(p) }
+        (!src.is_empty() && !src.contains(':') && src.contains('/')).then(|| root.join(p))
+    }
+
+    /// The library's own files are written relative to it with `/`, whatever
+    /// the system, and read back as paths here (docs/FORMAT.md); an older build
+    /// finds them too, so FORMAT stays. Files outside the library and links stay
+    /// as written.
+    #[test]
+    fn sources_are_written_relative_to_the_library() {
+        let lib = Lib::new("portable");
+        let mut s = lib.open();
+        let assets = Store::assets_in(&lib.0);
+        crate::vfs::create_dir_all(assets.join("files/u")).unwrap();
+        for f in ["p.png", "c.png", "files/u/说明.pdf"] { crate::vfs::write(assets.join(f), b"x").unwrap(); }
+        let outside = crate::vfs::temp_dir().join(format!("qmd-outside-{}.png", uuid::Uuid::new_v4()));
+        crate::vfs::write(&outside, b"x").unwrap();
+        let abs = |p: &Path| crate::docxml::esc_attr(&p.to_string_lossy());
+        let page = |c: &str, p: &str, o: &str, f: &str| format!("<title cover=\"{c}\">页</title>\n<img src=\"{p}\"/>\n<img src=\"{o}\"/>\n<img src=\"https://example.com/b.png\"/>\n<p>附件：<source path=\"{f}\" name=\"说明.pdf\"/></p>\n<figure view-type=\"Preview\"><source path=\"{f}\" name=\"说明.pdf\"/></figure>\n");
+        let doc = docxml::parse(&page(&abs(&assets.join("c.png")), &abs(&assets.join("p.png")), &abs(&outside), &abs(&assets.join("files/u/说明.pdf")))).unwrap();
+        let id = s.create_from(&doc).unwrap();
+        let written = crate::vfs::read_to_string(s.path(&id)).unwrap();
+        let canonical = |x: String| docxml::serialize(&docxml::parse(&x).unwrap());
+        let want = canonical(page(".assets/c.png", ".assets/p.png", &abs(&outside), ".assets/files/u/说明.pdf"));
+        assert_eq!(written, want);
+        // Read back: the same paths as before it was written.
+        let back = s.load_for_edit(&id, false).unwrap();
+        assert_eq!(docxml::serialize(&back), docxml::serialize(&doc));
+        // Saved unchanged, the same bytes.
+        s.save(&id, &back).unwrap();
+        assert_eq!(crate::vfs::read_to_string(s.path(&id)).unwrap(), want);
+        // An older build reads each of the library's files where it is.
+        for src in [".assets/c.png", ".assets/p.png", ".assets/files/u/说明.pdf"] {
+            assert!(image_path_v0_1_14(&lib.0, src).is_some_and(|p| p.fs_is_file()), "{src}");
+        }
+        let _ = crate::vfs::remove_file(&outside);
+    }
+
+    /// A page from before the rule keeps absolute paths: this computer's from
+    /// where the library was, another system's (`C:\…` on a Mac, `/Users/…` on
+    /// Windows). Each finds the file in this library's images folder and is
+    /// written relative at the next save; one found nowhere stays as written.
+    #[test]
+    fn absolute_sources_from_elsewhere_become_relative() {
+        let lib = Lib::new("portable-old");
+        let mut s = lib.open();
+        let assets = Store::assets_in(&lib.0);
+        crate::vfs::create_dir_all(assets.join("files/u")).unwrap();
+        for f in ["p.png", "c.png", "files/u/说明.pdf"] { crate::vfs::write(assets.join(f), b"x").unwrap(); }
+        let id = s.create_from(&doc("页")).unwrap();
+        let moved = crate::vfs::temp_dir().join("qmd-library-was-here").join(".assets").join("files").join("u").join("说明.pdf");
+        let page = |c: &str, p: &str, f: &str, gone: &str| format!("<title cover=\"{c}\">页</title>\n<img src=\"{p}\"/>\n<img src=\"{gone}\"/>\n<p>附件：<source path=\"{f}\" name=\"说明.pdf\"/></p>\n");
+        let gone = "C:\\Users\\me\\Pictures\\别处.png";
+        let old = page("C:\\Users\\me\\Documents\\Quiet.md\\.assets\\c.png", "/Users/me/Documents/Quiet.md/.assets/p.png", &crate::docxml::esc_attr(&moved.to_string_lossy()), gone);
+        crate::vfs::write(s.path(&id), &old).unwrap();
+        let here = s.load_for_edit(&id, false).unwrap();
+        let shown: Vec<String> = here.cover.iter().map(|c| c.src.clone()).chain(here.asset_sources()).collect();
+        let found = |f: &str| assets.join(f).to_string_lossy().into_owned();
+        assert_eq!(shown, [found("c.png"), found("p.png"), gone.to_string(), found("files/u/说明.pdf")]);
+        // A board keeps its images' paths as written and reads them here too.
+        for w in ["C:\\Users\\me\\Documents\\Quiet.md\\.assets\\p.png", "/Users/me/Documents/Quiet.md/.assets/p.png", ".assets\\p.png", ".assets/p.png"] {
+            assert_eq!(image_path_in(&lib.0, w), Some(assets.join("p.png")), "{w}");
+        }
+        assert_eq!(image_path_in(&lib.0, gone), None);
+        s.save(&id, &here).unwrap();
+        let want = docxml::serialize(&docxml::parse(&page(".assets/c.png", ".assets/p.png", ".assets/files/u/说明.pdf", &crate::docxml::esc_attr(gone))).unwrap());
+        assert_eq!(crate::vfs::read_to_string(s.path(&id)).unwrap(), want);
+    }
+
+    /// docs/FORMAT.md's rule, for every writer: what a library holds names its
+    /// own files relative, with `/`. Every file each one writes (a page, a
+    /// Markdown page in a folder, one outside the library with its copies,
+    /// 思源导入, a board, the library's own records) is scanned for a `\`, a
+    /// drive letter or the library's absolute path. (A file outside the
+    /// library keeps its absolute path: the test uses none.)
+    #[test]
+    fn no_writer_keeps_a_platform_path() {
+        let lib = Lib::new("portable-guard");
+        let mut s = lib.open();
+        let assets = Store::assets_in(&lib.0);
+        crate::vfs::create_dir_all(assets.join("files/u")).unwrap();
+        for f in ["p.png", "c.png", "files/u/说明.pdf"] { crate::vfs::write(assets.join(f), b"x").unwrap(); }
+        let abs = |f: &str| crate::docxml::esc_attr(&assets.join(f).to_string_lossy());
+        // As pasting, inserting and importing leave them in memory: absolute.
+        let page = docxml::parse(&format!("<title cover=\"{}\">页</title>\n<img src=\"{}\"/>\n<p>附件：<source path=\"{f}\" name=\"说明.pdf\"/></p>\n<figure view-type=\"Preview\"><source path=\"{f}\" name=\"说明.pdf\"/></figure>\n", abs("c.png"), abs("p.png"), f = abs("files/u/说明.pdf"))).unwrap();
+        let folder = s.create_folder("工作", None).unwrap();
+        s.create_from(&page).unwrap();
+        s.create_from_in(&page, Some(&folder)).unwrap();
+        // Markdown in the library, and 导入 Markdown (its pictures copied into the library first).
+        let md = s.create_markdown(&page, "").unwrap();
+        s.set_parent(&md, Some(&folder)).unwrap();
+        s.create_markdown(&page, "").unwrap();
+        // A Markdown file outside the library: the library's files copied beside it.
+        let outside = crate::vfs::temp_dir().join(format!("qmd-outside-{}", uuid::Uuid::new_v4()));
+        crate::vfs::create_dir_all(&outside).unwrap();
+        let out = crate::markdown::write_file_with(&page, "", &crate::markdown::Options { library_dir: Some(&lib.0), base: Some(&outside), name: Some("外面"), ..Default::default() });
+        crate::vfs::write(outside.join("外面.md"), &out.text).unwrap();
+        assert!(!out.files.is_empty());
+        // 思源导入.
+        let siyuan = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/siyuan/data");
+        s.begin_batch().unwrap();
+        crate::siyuan::import(&mut s, &crate::siyuan::open(&siyuan).unwrap(), None, &Default::default(), &mut crate::siyuan::StaticTables).unwrap();
+        s.end_batch().unwrap();
+        // A board's pictures, as inserting one keeps it.
+        let mut board = crate::whiteboard::Board::default();
+        let path = crate::paths::portable_in(&assets.join("p.png"), &lib.0);
+        board.files.insert("f".into(), crate::board::types::FileData { id: "f".into(), mime_type: "image/png".into(), data_url: None, path, created: 0, last_retrieved: None, version: None, extra: Default::default() });
+        s.create_board_in("画板", &board, None).unwrap();
+        fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in crate::vfs::read_dir(dir).unwrap().flatten() { let p = e.path(); if p.fs_is_dir() { files(&p, out) } else { out.push(p) } }
+        }
+        let mut written = vec![];
+        files(&lib.0, &mut written);
+        files(&outside, &mut written);
+        let drive = regex::Regex::new(r#"(^|[^A-Za-z0-9])[A-Za-z]:[\\/]"#).unwrap();
+        let texts = ["xml", "md", "excalidraw", "json"];
+        let mut scanned = 0;
+        for p in written.iter().filter(|p| p.extension().is_some_and(|e| texts.contains(&&*e.to_string_lossy()))) {
+            let text = crate::vfs::read_to_string(p).unwrap();
+            // JSON escapes its own (`\"`, `\n`, `\u…`); a path's `\` is `\\` there.
+            let slash = if p.extension().is_some_and(|e| e != "md" && e != "xml") { text.contains("\\\\") } else { text.contains('\\') };
+            assert!(!slash && !drive.is_match(&text) && !text.contains(&*lib.0.to_string_lossy()), "{}:\n{text}", p.display());
+            scanned += 1;
+        }
+        assert!(scanned >= 10, "{scanned}");
+        let _ = crate::vfs::remove_dir_all(&outside);
     }
 }

@@ -322,7 +322,7 @@ fn add_files(_v: &mut TableView, rec: RecId, fid: FieldId, window: &mut Window, 
                 let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) else { continue };
                 let dir = crate::store::Store::assets_dir().join("files").join(uuid::Uuid::new_v4().to_string());
                 if fdl_core::vfs::create_dir_all(&dir).is_err() || fdl_core::vfs::copy(&p, dir.join(&name)).is_err() { continue; }
-                let rel = dir.join(&name).strip_prefix(&root).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_else(|_| dir.join(&name).to_string_lossy().to_string());
+                let rel = fdl_core::paths::portable_in(&dir.join(&name), &root).unwrap_or_else(|| dir.join(&name).to_string_lossy().to_string());
                 added.push(Attachment { path: rel, name });
             }
             if added.is_empty() { return; }

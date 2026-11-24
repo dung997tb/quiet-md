@@ -57,6 +57,12 @@ The same mapping (a page with children ⇄ a folder with its own document) is me
 
 - Document links are relative to the current file. DocxXML uses `<cite type="doc" href="../Work/Weekly report.xml">` and Markdown uses standard links. On read, the app resolves paths to runtime IDs. On write, it converts them back, so copying the whole folder preserves the links. The reader still accepts legacy `doc-id` links.
 - Image and attachment paths are relative to the library folder (`.assets/…`).
+- **Every path a file in the library keeps is relative and uses `/`, on every system**: image and attachment sources, `<title cover>`, a board's `files[].path`, document and file links. A file written on Windows reads the same on a Mac and the other way round. `fdl_core::paths` holds the shared functions: `portable` (written relative to the library or to the document's folder) and `resolve` (read back, either `/` or `\` taken).
+  - In memory a page's own files are absolute paths on this computer; `Store` converts when it reads and writes one, so editing, copying and exporting need not.
+  - A file outside the library keeps its absolute path, as written.
+  - Pages from before the rule keep absolute paths, this system's or another's (`C:\Users\…\.assets\x.png` on a Mac, `/Users/…/.assets/x.png` on Windows). The reader finds the same file under this library's `.assets/` (the part after the path's last `assets` / `.assets` folder), and the next save writes it relative.
+  - Older versions already read `.assets/…` relative to the library, so the rule did not change FORMAT.
+  - `no_writer_keeps_a_platform_path` (store tests) scans what every writer leaves in a library (DocxXML, Markdown in the library and outside it, 思源导入, boards, the library's records) for a `\`, a drive letter or the library's absolute path.
 - Plain links to files, such as `[Report](attachments/Report.pdf)` or `[Weekly report](../Work/Weekly%20report.md)` in Markdown and `<a href>` in DocxXML, are relative to the current file. Moving or renaming a document, the file a link points at or a folder holding either rewrites them like document links; a link that leaves the library still points at the same file. Clicking one opens a library document or a Markdown file in the app, opens another file in its system app, and only reveals a folder or a file that would run a program.
 
 ### Metadata by device (.quiet/meta/, FORMAT 5 and 6)
