@@ -387,6 +387,8 @@ pub struct Store {
     /// FORMAT 5: the library as `load_meta` last took it in or `save_meta`
     /// last wrote it (`None`: since then not known).
     synced: std::cell::RefCell<Option<Synced>>,
+    /// FORMAT 6: where this computer saw each page's file (`meta::Here`).
+    here: meta::Here,
 }
 
 /// What `load_meta` would take in again is already in memory while no device
@@ -1371,17 +1373,19 @@ impl Store {
                 }
             }
         }
+        if !flat && !crate::vfs::is_dataless(&marker) && Self::format_at(&root) >= 6 && let Err(e) = Self::tend_meta(&root, &me, key, &mut warnings) { warnings.push(format!("无法整理文档索引：{e}")); }
         let base = if flat { root.clone() } else { internal.clone() };
         let trash = load_json(&base.join("trash").join("index.json"), "回收站索引", &mut warnings);
         let v5 = !flat && Self::format_at(&root) >= 5;
         let v6 = v5 && Self::format_at(&root) >= 6;
         let mut store = Store { file_changes: vec![], top_dir: root, index: HashMap::new(), foreign: DiskIndex::new(), trash, flat, warnings, migrated: None, loaded: Default::default(), copied: Default::default(), parsed: HashMap::new(), batch: Default::default(), view: Default::default(),
-            v5, me, clock: Default::default(), seen: Default::default(), merged: Default::default(), key: key.to_string(), place_by_hand: true, v6, seen_trash: Default::default(), purging: Default::default(), synced: Default::default() };
+            v5, me, clock: Default::default(), seen: Default::default(), merged: Default::default(), key: key.to_string(), place_by_hand: true, v6, seen_trash: Default::default(), purging: Default::default(), synced: Default::default(), here: Default::default() };
         if flat {
             store.index = load_json(&base.join("index.json"), "文档索引", &mut store.warnings);
             store.flat_folders()?;
         } else if v5 {
             let mut warnings = vec![];
+            if v6 { store.here = meta::Here::read(&store.top_dir, key, &store.me.id); }
             store.load_meta(&mut warnings);
             store.mark_synced(true, HashSet::new());
             store.warnings.extend(warnings);
@@ -1419,6 +1423,23 @@ impl Store {
         let _locks = WriteLock(vec![lock_file(&lock_path_at(root))?, lock_file(&root.join(INTERNAL).join(".lock"))?]);
         if Self::format_at(root) < 5 { meta::upgrade(root, me, warnings)?; }
         if Self::format_at(root) == 5 && Self::newest() >= 6 { meta::upgrade6(root, me, warnings)?; }
+        Ok(())
+    }
+
+    /// FORMAT 6, under the write lock: this device's metadata from one whole
+    /// file (as the development builds wrote it) to shards, and once a day
+    /// its shards cleaned (sync.md 3.3).
+    fn tend_meta(root: &Path, me: &Device, key: &str, warnings: &mut Vec<String>) -> Result<()> {
+        let mut here = meta::Here::read(root, key, &me.id);
+        let due = meta::now_ms().saturating_sub(here.cleaned) >= meta::DAY_MS;
+        if !due && !meta::needs_shards(root, &me.id) { return Ok(()) }
+        let _lock = WriteLock(vec![lock_file(&lock_path_at(root))?]);
+        meta::to_shards(root, me, warnings)?;
+        if due {
+            meta::clean_all(root, me, warnings)?;
+            here.cleaned = meta::now_ms();
+            here.save(root, key, &me.id)?;
+        }
         Ok(())
     }
 
@@ -2291,14 +2312,21 @@ impl Store {
         keys.extend(found.docs.iter().cloned());
         keys.extend(found.pending.iter().cloned());
         let mut left_out = HashSet::new();
+        let mut gone = vec![];
         if !found.partial {
             // Not here (yet, or gone outside the app): left out, not removed, so
             // another device's entry for a file still on its way keeps its settings.
-            let seen = self.seen.get_mut();
-            disk.retain(|k, a| keys.contains(k) || { seen.remove(&a.id); left_out.insert(k.clone()); false });
+            // FORMAT 6: one whose file was here, where it is still expected, is
+            // gone (deleted outside the app) and gets a tombstone.
+            let (seen, here, v6) = (self.seen.get_mut(), &self.here.seen, self.v6);
+            disk.retain(|k, a| keys.contains(k) || {
+                seen.remove(&a.id);
+                if v6 && here.get(&a.id) == Some(k) { gone.push(a.id.clone()) } else { left_out.insert(k.clone()); }
+                false
+            });
         }
         let disk_left_out = !left_out.is_empty();
-        let mut dirty = disk_left_out;
+        let mut dirty = disk_left_out || !gone.is_empty();
         for key in &keys {
             if disk.contains_key(key) { continue; }
             let t = crate::vfs::metadata(self.abs(key.trim_end_matches('/'))).ok().and_then(|m| m.modified().ok())
@@ -2369,9 +2397,13 @@ impl Store {
         self.parsed.retain(|id, _| seen.contains(id.as_str()));
         // Files that went only leave stale paths behind, which the next launch skips.
         if reparsed { let _ = self.save_parsed(); }
+        // Not written (no lock): still seen here, the next `list` writes it.
+        let mut wrote_gone = false;
         if dirty && _lock.is_some() {
             let _ = self.save_index();
+            wrote_gone = !gone.is_empty() && self.write_gone(&gone).is_ok();
         }
+        if self.v6 { self.saw(&disk, &keys, &found.pending, found.partial, &gone, wrote_gone); }
         // Entries for files not here are left out of memory but not of the
         // disk: memory and the disk still agree but for them (`Synced::absent`),
         // so the next write reads nothing again until one of their files
@@ -2379,6 +2411,47 @@ impl Store {
         // Written just above (`save_index` marked memory as the disk); unwritten, read next time.
         if disk_left_out && _lock.is_some() && let Some(s) = self.synced.get_mut() { s.absent.extend(left_out); }
         out
+    }
+
+    /// FORMAT 6: the files `list` found here noted in `meta::Here` (a
+    /// placeholder is not one: it never was here), the `gone` ones dropped
+    /// once their tombstones are written (kept until then).
+    /// Only items with a record: one without is found from its file on
+    /// every device, and nothing is written when it goes. A whole scan
+    /// also forgets what is no longer listed.
+    fn saw(&mut self, disk: &DiskIndex, keys: &HashSet<String>, pending: &[String], partial: bool, gone: &[String], wrote: bool) {
+        let mut changed = false;
+        let seen = &mut self.here.seen;
+        if wrote { for id in gone { changed |= seen.remove(id).is_some(); } }
+        let pending: HashSet<&str> = pending.iter().map(String::as_str).collect();
+        let merged = self.merged.borrow();
+        let mut listed = 0;
+        for (k, a) in disk {
+            match seen.get(&a.id) {
+                Some(p) if p == k => { listed += 1; continue }
+                Some(_) => listed += 1,
+                None => {}
+            }
+            if a.id.is_empty() || !keys.contains(k) || pending.contains(k.as_str()) || !merged.items.contains_key(&a.id) { continue }
+            if seen.insert(a.id.clone(), k.clone()).is_none() { listed += 1; }
+            changed = true;
+        }
+        drop(merged);
+        if !partial && listed + if wrote { 0 } else { gone.len() } < seen.len() {
+            let ids: HashSet<&str> = disk.values().map(|a| a.id.as_str()).chain(gone.iter().filter(|_| !wrote).map(String::as_str)).collect();
+            seen.retain(|id, _| ids.contains(id.as_str()));
+            changed = true;
+        }
+        if changed { let _ = self.here.save(&self.top_dir, &self.key, &self.me.id); }
+    }
+
+    /// FORMAT 6: `gone` tombstones for pages deleted outside the app, later
+    /// than everything about them. `path` goes too, at the same stamp, so a
+    /// device's own older `path` does not outlive the tombstone in its files.
+    fn write_gone(&self, ids: &[String]) -> Result<()> {
+        let at = serde_json::json!({ "at": now() });
+        let changes = ids.iter().flat_map(|id| [(id.clone(), "gone".to_string(), at.clone()), (id.clone(), "path".to_string(), serde_json::Value::Null)]).collect();
+        meta::commit_over(&self.top_dir, &self.me, &self.clock, &mut self.merged.borrow_mut(), changes, &mut vec![])
     }
 
     /// What `list` parsed last launch, for the files still where they were.
@@ -3426,8 +3499,28 @@ mod tests {
         }
         /// What every device's file says, by path.
         fn index(&self) -> DiskIndex { meta::load(&self.0, &device().id, &mut vec![]).disk_index() }
-        /// This device's file.
-        fn meta_file(&self) -> PathBuf { meta::dir(&self.0).join(format!("{}.json", device().id)) }
+        /// Device `d`'s file holding `item`: its shard, or its whole file before shards.
+        fn dev_file(&self, d: &str, item: &str) -> PathBuf {
+            let own = meta::dir(&self.0).join(d);
+            if own.fs_is_dir() { own.join(format!("{:02x}.json", meta::shard_of(item))) } else { meta::dir(&self.0).join(format!("{d}.json")) }
+        }
+        /// Device `d`'s files as one: `{"items": …}` from its shards, or its whole file.
+        fn dev_items(&self, d: &str) -> serde_json::Value {
+            let own = meta::dir(&self.0).join(d);
+            if !own.fs_is_dir() { return reread(&meta::dir(&self.0).join(format!("{d}.json"))).unwrap_or(serde_json::json!({})) }
+            let mut items = serde_json::Map::new();
+            for e in crate::vfs::read_dir(&own).unwrap().flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name == "device.json" || !name.ends_with(".json") { continue }
+                let v: serde_json::Value = reread(&e.path()).unwrap();
+                items.extend(v["items"].as_object().cloned().unwrap_or_default());
+            }
+            serde_json::json!({ "items": items })
+        }
+        /// `dev_items` as the files print it.
+        fn dev_text(&self, d: &str) -> String { serde_json::to_string_pretty(&self.dev_items(d)).unwrap() }
+        /// This device's files as one (`dev_text`).
+        fn meta_text(&self) -> String { self.dev_text(&device().id) }
         /// Moved to the new layout, then opened.
         fn migrated(&self) -> Store {
             Store::migrate(&self.0).unwrap();
@@ -4301,7 +4394,7 @@ mod tests {
         a.list();
         other_pins(&lib, "bbbb", &x, true);
         assert!(pinned(&mut a, &x));
-        crate::vfs::remove_file(meta::dir(&lib.0).join("bbbb.json")).unwrap();
+        crate::vfs::remove_dir_all(meta::dir(&lib.0).join("bbbb")).unwrap();
         assert!(!pinned(&mut a, &x), "its file gone, so is what it said");
         other_pins(&lib, "cccc", &x, true);
         assert!(pinned(&mut a, &x), "a new device's file");
@@ -4316,7 +4409,7 @@ mod tests {
         let x = a.create_from(&doc("甲")).unwrap();
         other_pins(&lib, "bbbb", &x, true);
         assert!(pinned(&mut a, &x));
-        let path = meta::dir(&lib.0).join("bbbb.json");
+        let path = lib.dev_file("bbbb", &x);
         let was = crate::vfs::metadata(&path).unwrap();
         let text = crate::vfs::read_to_string(&path).unwrap();
         assert_eq!(text.matches("true").count(), 1);
@@ -4407,7 +4500,7 @@ mod tests {
         let mut s = lib.open();
         // 4 → 5 → 6 in one go.
         assert!(s.v6 && Store::format_at(&lib.0) == 6, "{:?}", s.warnings);
-        assert!(lib.meta_file().fs_is_file() && lib.0.join(".quiet/index.json.v4").fs_is_file() && !lib.0.join(".quiet/index.json").fs_exists());
+        assert!(meta::dir(&lib.0).join(device().id).fs_is_dir() && lib.0.join(".quiet/index.json.v4").fs_is_file() && !lib.0.join(".quiet/index.json").fs_exists());
         let list = s.list();
         let by = |id: &str| list.iter().find(|e| e.id == id).unwrap().meta.clone();
         assert!(by(&a).pinned && by(&b).starred > 0 && by(&b).parent.as_deref() == Some(f.as_str()));
@@ -4458,17 +4551,17 @@ mod tests {
         assert_eq!(first, (order.clone(), vec![(gone.clone(), Some(f.clone()))], true));
         let trash = lib.0.join(".quiet/trash");
         assert!(trash.join("index.json.v5").fs_is_file() && !trash.join("index.json").fs_exists());
-        let file = crate::vfs::read_to_string(lib.meta_file()).unwrap();
+        let file = lib.meta_text();
         assert!(file.contains("\"trashed\"") && file.contains("\"order\": [\n"), "{file}");
         // A crash after this device's file, before the marker: done again, the same.
         let marker = lib.0.join(".quiet/format.json");
         let m: FormatMarker = reread(&marker).unwrap();
         write_atomic(&marker, &serde_json::to_vec(&FormatMarker { format: 5, id: m.id }).unwrap()).unwrap();
         crate::vfs::rename(trash.join("index.json.v5"), trash.join("index.json")).unwrap();
-        let mine = crate::vfs::read_to_string(lib.meta_file()).unwrap();
+        let mine = lib.meta_text();
         assert_eq!(state(&lib), first);
         let keys = |t: &str| -> Vec<String> { let v: serde_json::Value = serde_json::from_str(t).unwrap(); kids.iter().filter_map(|k| v["items"][k]["order"][0].as_str().map(str::to_string)).collect() };
-        assert_eq!(keys(&crate::vfs::read_to_string(lib.meta_file()).unwrap()), keys(&mine));
+        assert_eq!(keys(&lib.meta_text()), keys(&mine));
         // Restored, it goes back where it was.
         let mut s = lib.open();
         s.restore(&gone).unwrap();
@@ -4519,25 +4612,290 @@ mod tests {
         // 彻底删除: gone on both, a tombstone in the device's file.
         b.purge(&x).unwrap();
         assert!(!ids(&mut a).contains(&x));
-        assert!(crate::vfs::read_to_string(meta::dir(&lib.0).join("bbbb.json")).unwrap().contains("\"purged\""));
+        assert!(lib.dev_text("bbbb").contains("\"purged\""));
+    }
+
+    /// Device `d`'s shards made back into one whole file, as the
+    /// development builds of FORMAT 6 wrote it.
+    fn unshard(lib: &Lib, d: &str) {
+        let own = meta::dir(&lib.0).join(d);
+        let device: serde_json::Value = reread(&own.join("device.json")).unwrap();
+        let v = serde_json::json!({ "v": 1, "device": device, "items": lib.dev_items(d)["items"] });
+        crate::vfs::remove_dir_all(&own).unwrap();
+        crate::vfs::write(meta::dir(&lib.0).join(format!("{d}.json")), serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    }
+
+    /// Every field of the merged view: value, stamp and device.
+    fn view(lib: &Lib) -> BTreeMap<String, BTreeMap<String, (serde_json::Value, u64, String)>> {
+        meta::load(&lib.0, "", &mut vec![]).items.into_iter().map(|(id, f)| (id, f.into_iter().map(|(k, w)| (k, (w.v, w.ts, w.dev))).collect())).collect()
+    }
+
+    /// A folder's files by name, with what they hold.
+    fn contents(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        crate::vfs::read_dir(dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".json")).map(|e| (e.file_name().to_string_lossy().into_owned(), crate::vfs::read(e.path()).unwrap())).collect()
+    }
+
+    /// A folder's files by name, with what changes whenever one is written.
+    fn written_stamps(dir: &Path) -> BTreeMap<String, u64> {
+        crate::vfs::read_dir(dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".json")).map(|e| {
+            let m = crate::vfs::metadata(e.path()).unwrap();
+            (e.file_name().to_string_lossy().into_owned(), meta::written(&e.path(), Some(&m), false))
+        }).collect()
+    }
+
+    /// Two devices' whole files (development FORMAT 6): 回收站, 彻底删除,
+    /// 置顶, 星标 and hand order. Returns the folder and its pages.
+    fn whole_file_library(lib: &Lib) -> (String, Vec<String>) {
+        let mut a = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("aaaa")).unwrap();
+        let f = a.create_folder("夹", None).unwrap();
+        let p: Vec<String> = (0..8).map(|n| a.create_from_in(&doc(&format!("页{n}")), Some(&f)).unwrap()).collect();
+        a.move_in_tree(&p[0], Some(&f), None).unwrap();
+        a.set_pinned(&p[1], true).unwrap();
+        let mut b = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("bbbb")).unwrap();
+        b.list();
+        b.set_starred(&p[2], true).unwrap();
+        b.move_in_tree(&p[5], Some(&f), Some(&p[1])).unwrap();
+        b.set_pinned(&p[1], false).unwrap();
+        a.delete(&p[3], None).unwrap();
+        a.delete(&p[4], None).unwrap();
+        a.purge(&p[4]).unwrap();
+        drop((a, b));
+        unshard(lib, "aaaa");
+        unshard(lib, "bbbb");
+        (f, p)
+    }
+
+    #[test]
+    fn whole_device_files_become_shards() {
+        let lib = Lib::new("to-shards");
+        let (f, p) = whole_file_library(&lib);
+        let before = view(&lib);
+        assert!(before[&p[4]].contains_key("purged") && before[&p[3]].contains_key("trashed") && before[&p[2]].contains_key("starred"));
+        // What a third device lists, before and after.
+        let listed = |lib: &Lib| {
+            let mut c = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("cccc")).unwrap();
+            let mut l: Vec<(String, Meta)> = c.list().into_iter().map(|e| (e.id, e.meta)).collect();
+            l.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut t: Vec<String> = c.list_trash().into_iter().map(|t| t.id).collect();
+            t.sort();
+            (l, t, in_order(&mut c, Some(&f)))
+        };
+        let list = listed(&lib);
+        assert_eq!(list.1, vec![p[3].clone()]);
+        let whole = crate::vfs::read(meta::dir(&lib.0).join("aaaa.json")).unwrap();
+        // This device converts its own file only.
+        let mut a = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("aaaa")).unwrap();
+        assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+        let d = meta::dir(&lib.0);
+        assert!(d.join("aaaa").fs_is_dir() && !d.join("aaaa.json").fs_exists() && !d.join("aaaa.tmp").fs_exists());
+        assert_eq!(crate::vfs::read(d.join("aaaa.json.single")).unwrap(), whole);
+        assert!(d.join("bbbb.json").fs_is_file() && !d.join("bbbb").fs_exists(), "the other device's stays whole");
+        assert_eq!(view(&lib), before);
+        assert!(a.list().iter().any(|e| e.id == p[0]));
+        assert_eq!(listed(&lib), list);
+        // The other device, when it opens.
+        drop(a);
+        Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("bbbb")).unwrap();
+        assert!(d.join("bbbb").fs_is_dir() && !d.join("bbbb.json").fs_exists() && d.join("bbbb.json.single").fs_is_file());
+        assert_eq!(view(&lib), before);
+        assert_eq!(listed(&lib), list);
+        // Opened again: nothing to convert, nothing written.
+        let stamps = written_stamps(&d.join("aaaa"));
+        let a = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("aaaa")).unwrap();
+        assert!(!meta::needs_shards(&lib.0, "aaaa") && a.warnings.is_empty());
+        assert_eq!(written_stamps(&d.join("aaaa")), stamps);
+    }
+
+    /// A crash midway through `to_shards`: opened again, the same result.
+    #[test]
+    fn a_conversion_cut_short_ends_the_same() {
+        let lib = Lib::new("to-shards-crash");
+        whole_file_library(&lib);
+        let d = meta::dir(&lib.0);
+        let whole = crate::vfs::read(d.join("aaaa.json")).unwrap();
+        meta::to_shards(&lib.0, &dev("aaaa"), &mut vec![]).unwrap();
+        let (shards, before) = (contents(&d.join("aaaa")), view(&lib));
+        // Cut short while writing `<id>.tmp/`.
+        crate::vfs::remove_dir_all(d.join("aaaa")).unwrap();
+        crate::vfs::write(d.join("aaaa.json"), &whole).unwrap();
+        crate::vfs::create_dir_all(d.join("aaaa.tmp")).unwrap();
+        crate::vfs::write(d.join("aaaa.tmp/07.json"), b"{ half").unwrap();
+        assert!(!view(&lib).is_empty(), "the folder half made is not read");
+        let a = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("aaaa")).unwrap();
+        assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+        assert!(!d.join("aaaa.tmp").fs_exists() && !d.join("aaaa.json").fs_exists());
+        assert_eq!((contents(&d.join("aaaa")), view(&lib)), (shards.clone(), before.clone()));
+        drop(a);
+        // Cut short before the whole file went: only that is left to do.
+        crate::vfs::write(d.join("aaaa.json"), &whole).unwrap();
+        assert_eq!(view(&lib), before, "the folder counts, not the file");
+        let stamps = written_stamps(&d.join("aaaa"));
+        let a = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("aaaa")).unwrap();
+        assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+        assert!(!d.join("aaaa.json").fs_exists());
+        assert_eq!(written_stamps(&d.join("aaaa")), stamps, "the shards are not written again");
+        assert_eq!((contents(&d.join("aaaa")), view(&lib)), (shards, before));
+    }
+
+    #[test]
+    fn a_change_rewrites_its_shard_only() {
+        let lib = Lib::new("shard-write");
+        let mut a = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("aaaa")).unwrap();
+        let ids: Vec<String> = (0..40).map(|n| a.create_from(&doc(&format!("页{n}")))).collect::<Result<_>>().unwrap();
+        a.list();
+        let own = meta::dir(&lib.0).join("aaaa");
+        let before = written_stamps(&own);
+        assert!(before.len() > 20, "{before:?}");
+        a.set_pinned(&ids[7], true).unwrap();
+        let after = written_stamps(&own);
+        let changed: Vec<&String> = before.keys().filter(|k| before.get(*k) != after.get(*k)).collect();
+        assert_eq!(changed, vec![&format!("{:02x}.json", meta::shard_of(&ids[7]))]);
+    }
+
+    fn gone_of(lib: &Lib, d: &str, id: &str) -> bool { lib.dev_items(d)["items"][id]["gone"].is_array() }
+
+    /// Deleted outside the app (sync.md 3.3): a tombstone, written only by a
+    /// device that saw the file and finds it gone in a whole scan.
+    #[test]
+    fn a_file_deleted_outside_gets_a_tombstone() {
+        let lib = Lib::new("gone");
+        let mut a = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("aaaa")).unwrap();
+        let x = a.create_from(&doc("甲")).unwrap();
+        a.list();
+        a.list();
+        let mut b = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("bbbb")).unwrap();
+        assert!(b.list().iter().any(|e| e.id == x));
+        let file = a.path(&x);
+        let text = crate::vfs::read(&file).unwrap();
+        crate::vfs::remove_file(&file).unwrap();
+        assert!(!a.list().iter().any(|e| e.id == x));
+        assert!(gone_of(&lib, "aaaa", &x) && view(&lib)[&x]["path"].0.is_null());
+        assert!(!b.list().iter().any(|e| e.id == x), "the other device leaves it out too");
+        assert!(!lib.index().values().any(|e| e.id == x));
+        // Written again later (its file back): here again.
+        meta::commit(&lib.0, &dev("bbbb"), &Default::default(), vec![(x.clone(), "path".into(), "甲.xml".into())], &mut vec![]).unwrap();
+        crate::vfs::write(&file, &text).unwrap();
+        assert!(a.list().iter().any(|e| e.id == x));
+        assert!(b.list().iter().any(|e| e.id == x));
+    }
+
+    #[test]
+    fn a_file_never_here_gets_no_tombstone() {
+        let lib = Lib::new("gone-unseen");
+        let mut a = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("aaaa")).unwrap();
+        let x = a.create_from(&doc("甲")).unwrap();
+        a.list();
+        let file = a.path(&x);
+        // This device never listed while the file was here: still on its way, for all it knows.
+        crate::vfs::remove_file(&file).unwrap();
+        let mut b = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("bbbb")).unwrap();
+        assert!(!b.list().iter().any(|e| e.id == x));
+        assert!(!gone_of(&lib, "bbbb", &x) && !view(&lib)[&x].contains_key("gone"));
+        // Its file arrives: listed, nothing lost.
+        crate::vfs::write(&file, "<title>甲</title>\n").unwrap();
+        assert!(b.list().iter().any(|e| e.id == x));
+    }
+
+    #[test]
+    fn a_placeholder_or_a_part_scan_is_not_a_deletion() {
+        let lib = Lib::new("gone-not");
+        let mut a = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("aaaa")).unwrap();
+        let x = a.create_from(&doc("甲")).unwrap();
+        let f = a.create_folder("夹", None).unwrap();
+        let y = a.create_from_in(&doc("乙"), Some(&f)).unwrap();
+        a.list();
+        a.list();
+        // Only in iCloud now: a placeholder in its place.
+        let file = a.path(&x);
+        crate::vfs::remove_file(&file).unwrap();
+        crate::vfs::write(layout::placeholder(&file).unwrap(), b"").unwrap();
+        assert!(a.list().iter().any(|e| e.id == x));
+        assert!(!gone_of(&lib, "aaaa", &x));
+        // A folder that could not be read: the scan is not whole.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            crate::vfs::remove_file(a.path(&y)).unwrap();
+            let dir = lib.0.join("夹");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+            a.list();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(!gone_of(&lib, "aaaa", &y));
+            // Read whole again: gone.
+            a.list();
+            assert!(gone_of(&lib, "aaaa", &y));
+        }
+    }
+
+    /// Clean-up (sync.md 3.3), on a clock the test sets.
+    #[test]
+    fn records_never_arrived_go_after_thirty_days() {
+        let lib = Lib::new("clean-arrive");
+        drop(Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("aaaa")).unwrap());
+        let t = crate::time::now_ms();
+        let at = |days: u64, item: &str, path: &str| {
+            meta::CLOCK.with(|c| c.set(Some(t - days * meta::DAY_MS)));
+            meta::commit(&lib.0, &dev("aaaa"), &Default::default(), vec![(item.into(), "path".into(), path.into()), (item.into(), "pinned".into(), true.into())], &mut vec![]).unwrap();
+        };
+        at(31, "old", "没来.xml");
+        at(29, "young", "也没来.xml");
+        at(31, "here", "在.xml");
+        crate::vfs::write(lib.0.join("在.xml"), "<title>在</title>\n").unwrap();
+        meta::CLOCK.with(|c| c.set(None));
+        meta::clean_all(&lib.0, &dev("aaaa"), &mut vec![]).unwrap();
+        let v = lib.dev_items("aaaa");
+        assert!(v["items"].get("old").is_none(), "{v}");
+        assert!(v["items"].get("young").is_some() && v["items"].get("here").is_some(), "{v}");
+    }
+
+    #[test]
+    fn tombstones_wait_for_every_active_device() {
+        let lib = Lib::new("clean-tomb");
+        drop(Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("aaaa")).unwrap());
+        let t = crate::time::now_ms();
+        let write = |days: u64, by: &str, changes: Vec<(&str, &str, serde_json::Value)>| {
+            meta::CLOCK.with(|c| c.set(Some(t - days * meta::DAY_MS)));
+            let changes = changes.into_iter().map(|(a, b, c)| (a.to_string(), b.to_string(), c)).collect();
+            meta::commit(&lib.0, &dev(by), &Default::default(), changes, &mut vec![]).unwrap();
+        };
+        // Long stopped: does not hold anything back.
+        write(100, "cccc", vec![("c", "pinned", true.into())]);
+        // Last wrote before the tombstone, but lately: has not seen it.
+        write(40, "bbbb", vec![("b", "pinned", true.into())]);
+        write(32, "aaaa", vec![("gone-1", "path", "甲.xml".into()), ("gone-2", "path", "乙.xml".into()), ("empty", "pinned", true.into())]);
+        write(31, "aaaa", vec![("gone-1", "gone", serde_json::json!({ "at": 1 })), ("gone-1", "path", serde_json::Value::Null), ("empty", "pinned", serde_json::Value::Null)]);
+        write(29, "aaaa", vec![("gone-2", "purged", 1.into())]);
+        meta::CLOCK.with(|c| c.set(None));
+        let clean = || { meta::clean_all(&lib.0, &dev("aaaa"), &mut vec![]).unwrap(); lib.dev_items("aaaa") };
+        let v = clean();
+        assert!(v["items"].get("gone-1").is_some() && v["items"].get("empty").is_some(), "bbbb has not seen them: {v}");
+        // Once bbbb writes again, it has.
+        write(0, "bbbb", vec![("b", "starred", 1.into())]);
+        meta::CLOCK.with(|c| c.set(None));
+        let v = clean();
+        assert!(v["items"].get("gone-1").is_none() && v["items"].get("empty").is_none(), "{v}");
+        assert!(v["items"].get("gone-2").is_some(), "29 days: kept");
+        assert!(!lib.index().values().any(|e| e.id == "gone-2"));
     }
 
     #[test]
     fn tombstones_go_after_thirty_days() {
         let lib = Lib::new("tombstones");
         let mut s = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("aaaa")).unwrap();
+        // Purged 31 days ago: the next write of its shard drops what this device said about it.
+        let t = crate::time::now_ms();
+        meta::CLOCK.with(|c| c.set(Some(t - 31 * meta::DAY_MS)));
         let x = s.create_from(&doc("甲")).unwrap();
         s.delete(&x, None).unwrap();
         s.purge(&x).unwrap();
-        let path = meta::dir(&lib.0).join("aaaa.json");
-        let mut v: serde_json::Value = serde_json::from_slice(&crate::vfs::read(&path).unwrap()).unwrap();
-        assert!(v["items"][&x]["purged"].is_array());
-        // Purged 31 days ago: the next write here drops what this device said about it.
-        v["items"][&x]["purged"][1] = (crate::time::now_ms() - 31 * 86_400_000).into();
-        crate::vfs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        meta::CLOCK.with(|c| c.set(None));
+        assert!(lib.dev_items("aaaa")["items"][&x]["purged"].is_array());
         let y = s.create_from(&doc("乙")).unwrap();
         s.set_pinned(&y, true).unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&crate::vfs::read(&path).unwrap()).unwrap();
+        // Another page of the same shard.
+        let z = (0..).map(|n| format!("同片-{n}")).find(|z| meta::shard_of(z) == meta::shard_of(&x)).unwrap();
+        meta::commit(&lib.0, &dev("aaaa"), &Default::default(), vec![(z.clone(), "pinned".into(), true.into())], &mut vec![]).unwrap();
+        let v = lib.dev_items("aaaa");
         assert!(v["items"].get(&x).is_none() && v["items"].get(&y).is_some(), "{v}");
         assert!(s.list_trash().is_empty() && !s.list().iter().any(|e| e.id == x));
     }
@@ -4551,7 +4909,7 @@ mod tests {
         a.move_in_tree(&p[0], Some(&f), Some(&p[1])).unwrap();
         let mut b = Store::open_as(lib.0.clone(), &library_key(&lib.0), dev("bbbb")).unwrap();
         let start = in_order(&mut b, Some(&f));
-        let file = |d: &str| -> serde_json::Value { serde_json::from_slice(&crate::vfs::read(meta::dir(&lib.0).join(format!("{d}.json"))).unwrap_or_else(|_| b"{}".to_vec())).unwrap() };
+        let file = |d: &str| lib.dev_items(d);
         let orders = |v: &serde_json::Value| -> Vec<String> { p.iter().filter(|id| v["items"][*id].get("order").is_some()).cloned().collect() };
         // A moves the first to the end, B the last to the front: each device's file names only its page.
         let last = start[4].clone();
@@ -4594,7 +4952,7 @@ mod tests {
         b.set_pinned(&x, false).unwrap();
         assert!(!c.list().into_iter().find(|e| e.id == x).unwrap().meta.pinned);
         a.set_starred(&x, false).unwrap();
-        let file = |d: &str| crate::vfs::read_to_string(meta::dir(&lib.0).join(format!("{d}.json"))).unwrap();
+        let file = |d: &str| lib.dev_text(d);
         assert!(!file("aaaa").contains("pinned") && file("bbbb").contains("pinned"));
         // A store that read before another device wrote does not undo it with what it read.
         let y = a.create_from(&doc("另一篇")).unwrap();
@@ -4664,13 +5022,15 @@ mod tests {
         // The second write left the first (pinned: false) as the backup;
         // one more makes the backup pinned too.
         s.set_starred(&id, true).unwrap();
-        crate::vfs::write(lib.meta_file(), b"{ not json").unwrap();
+        let shard = lib.dev_file(&device().id, &id);
+        crate::vfs::write(&shard, b"{ not json").unwrap();
         let mut s = lib.open();
         assert_eq!(s.warnings.len(), 1, "{:?}", s.warnings);
         assert!(s.warnings[0].contains("已从备份恢复"));
         assert!(s.list()[0].meta.pinned);
         // The damaged file is kept for inspection, not overwritten.
-        let kept = crate::vfs::read_dir(meta::dir(&lib.0)).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{}.json.corrupt-", device().id))).count();
+        let name = shard.file_name().unwrap().to_string_lossy().into_owned();
+        let kept = crate::vfs::read_dir(shard.parent().unwrap()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{name}.corrupt-"))).count();
         assert_eq!(kept, 1);
         // Put back, for the next write to start from.
         assert!(lib.index().values().any(|a| a.pinned));
@@ -4680,9 +5040,10 @@ mod tests {
     fn corrupt_index_without_backup_still_lists_documents() {
         let lib = Lib::new("nobak");
         let mut s = lib.open();
-        s.create_from(&doc("一")).unwrap();
-        crate::vfs::write(lib.meta_file(), b"garbage").unwrap();
-        let _ = crate::vfs::remove_file(with_suffix(&lib.meta_file(), ".bak"));
+        let id = s.create_from(&doc("一")).unwrap();
+        let shard = lib.dev_file(&device().id, &id);
+        crate::vfs::write(&shard, b"garbage").unwrap();
+        let _ = crate::vfs::remove_file(with_suffix(&shard, ".bak"));
         let mut s = lib.open();
         assert!(s.warnings[0].contains("没有可用备份"));
         assert_eq!(s.list().len(), 1);
@@ -4776,8 +5137,9 @@ mod tests {
         let (gone, r) = s.delete_many(&items);
         r.unwrap();
         let writes = SYNCED_WRITES.with(|n| n.get());
-        // 回收站 index and its backup, library index and its backup, local state.
-        assert!(writes <= 5, "{writes} synced writes");
+        // Each shard written once for the index and once for the 回收站, and the local state.
+        let shards = items.iter().map(|(id, _)| meta::shard_of(id)).collect::<HashSet<_>>().len();
+        assert!(writes <= 2 * shards + 1, "{writes} synced writes for {shards} shards");
         assert_eq!(gone.len(), 21);
         assert!(s.list().is_empty());
         assert_eq!(s.list_trash().len(), 11, "the folder's pages ride along with it");
@@ -4820,7 +5182,8 @@ mod tests {
         assert_eq!(s.list_trash().len(), 10);
         SYNCED_WRITES.with(|n| n.set(0));
         s.purge_many(&ids).unwrap();
-        assert!(SYNCED_WRITES.with(|n| n.get()) <= 2, "the index and its backup");
+        let shards = ids.iter().map(|id| meta::shard_of(id)).collect::<HashSet<_>>().len();
+        assert!(SYNCED_WRITES.with(|n| n.get()) <= shards, "each shard once");
         assert!(s.list_trash().is_empty());
         let left = crate::vfs::read_dir(s.trash_dir()).unwrap().filter_map(|e| e.ok()).filter(|e| !e.file_name().to_string_lossy().starts_with("index.json")).count();
         assert_eq!(left, 0);
@@ -4857,7 +5220,7 @@ mod tests {
         let index = crate::vfs::read(trash.join("index.json")).unwrap();
         crate::vfs::rename(&trash, lib.0.join(".quiet/trash-away")).unwrap();
         crate::vfs::write(&trash, b"").unwrap();
-        let mut s = Store { file_changes: vec![], top_dir: lib.0.clone(), index: HashMap::new(), foreign: DiskIndex::new(), flat: false, migrated: None, trash: serde_json::from_slice(&index).unwrap(), warnings: vec![], loaded: Default::default(), copied: Default::default(), parsed: HashMap::new(), batch: Default::default(), view: Default::default(), v5: false, me: device(), clock: Default::default(), seen: Default::default(), merged: Default::default(), key: library_key(&lib.0), place_by_hand: true, v6: false, seen_trash: Default::default(), purging: Default::default(), synced: Default::default() };
+        let mut s = Store { file_changes: vec![], top_dir: lib.0.clone(), index: HashMap::new(), foreign: DiskIndex::new(), flat: false, migrated: None, trash: serde_json::from_slice(&index).unwrap(), warnings: vec![], loaded: Default::default(), copied: Default::default(), parsed: HashMap::new(), batch: Default::default(), view: Default::default(), v5: false, me: device(), clock: Default::default(), seen: Default::default(), merged: Default::default(), key: library_key(&lib.0), place_by_hand: true, v6: false, seen_trash: Default::default(), purging: Default::default(), synced: Default::default(), here: Default::default() };
         assert_eq!(s.list_trash().len(), 1);
         assert_eq!(s.trash.len(), 1);
     }
@@ -5083,7 +5446,7 @@ mod tests {
         // Attached and local information.
         assert!(by[w1.as_str()].meta.pinned);
         assert_eq!(by[w1.as_str()].meta.opened, 77);
-        let index = crate::vfs::read_to_string(lib.meta_file()).unwrap();
+        let index = lib.meta_text();
         assert!(!index.contains("opened") && !index.contains("外面") && index.contains("\"工作/子/\""));
         assert!(by[local.as_str()].meta.local());
         assert_eq!(s.load(&local).unwrap().plain_text(), "外面的笔记");
@@ -5840,7 +6203,7 @@ mod tests {
             if flat { Old::new(&lib, 3).write(); }
             let mut s = lib.open();
             assert_eq!(s.flat, flat);
-            let index = if flat { lib.0.join("index.json") } else { lib.meta_file() };
+            let index = || if flat { crate::vfs::read_to_string(lib.0.join("index.json")).unwrap_or_default() } else { lib.meta_text() };
             let journal = s.track_file_changes();
             let (f, ids) = s.batch(|s| {
                 let f = s.create_folder("导入", None).unwrap();
@@ -5851,11 +6214,11 @@ mod tests {
                 // A failure midway leaves the rest of the batch alone.
                 assert!(s.create_from_in(&doc("无处"), Some("不存在")).is_err());
                 // Nothing reached the index yet.
-                assert!(!crate::vfs::read_to_string(&index).unwrap_or_default().contains(&ids[0]));
+                assert!(!index().contains(&ids[0]));
                 assert_eq!(s.batch(|s| s.create_markdown_in(&doc("嵌套"), "", Some(&f)).unwrap()).map(|_| ()).ok(), Some(()));
                 (f, ids)
             }).unwrap();
-            assert!(crate::vfs::read_to_string(&index).unwrap().contains(&ids[0]));
+            assert!(index().contains(&ids[0]));
             if !flat {
                 assert!(lib.0.join("导入/笔记 4.md").fs_is_file() && lib.0.join("导入/子/深处.xml").fs_is_file());
             }
@@ -6195,10 +6558,12 @@ mod tests {
         let trash = lib.0.join(INTERNAL).join("trash").join("index.json");
         crate::vfs::create_dir_all(trash.parent().unwrap()).unwrap();
         crate::vfs::write(&trash, b"{}").unwrap();
-        let mine = lib.meta_file();
-        let (before, marker) = (crate::vfs::read(&mine).unwrap(), lib.0.join(INTERNAL).join("format.json"));
+        // Every one of this device's files.
+        let own = meta::dir(&lib.0).join(device().id);
+        let mine: Vec<PathBuf> = crate::vfs::read_dir(&own).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
+        let (before, marker) = (mine.iter().map(|p| crate::vfs::read(p).unwrap()).collect::<Vec<_>>(), lib.0.join(INTERNAL).join("format.json"));
         let format = crate::vfs::read(&marker).unwrap();
-        for f in [&mine, &other, &trash, &marker] { crate::vfs::set_dataless(f, true); }
+        for f in mine.iter().chain([&other, &trash, &marker]) { crate::vfs::set_dataless(f, true); }
         let mut s = lib.open();
         for what in ["文档索引", "other-device.json", "回收站索引", "format.json"] {
             assert!(s.warnings.iter().any(|w| w == &not_downloaded(what)), "{what}: {:?}", s.warnings);
@@ -6209,7 +6574,7 @@ mod tests {
         // This device's changes can't go to its file now: refused, not written over.
         let _ = s.list();
         assert!(s.create_from(&doc("二")).is_err());
-        assert_eq!(crate::vfs::read(&mine).unwrap(), before);
+        assert_eq!(mine.iter().map(|p| crate::vfs::read(p).unwrap()).collect::<Vec<_>>(), before);
         assert_eq!(crate::vfs::read(&marker).unwrap(), format);
         let names: Vec<String> = crate::vfs::read_dir(meta::dir(&lib.0)).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         assert!(names.iter().all(|n| !n.contains(".corrupt-")), "{names:?}");
